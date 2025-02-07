@@ -5,14 +5,16 @@
 # - streamlit run streamlit_nova_canvas.py
 # - streamlit run streamlit_nova_canvas.py --server.runOnSave True --server.port 8501
 
+import amazon_video_util
 import base64
 import boto3
 import datetime
 import file_utils
+import json
 import logging
+import random
 import streamlit as st
 
-from random import randint
 from amazon_image_gen import BedrockImageGenerator
 
 
@@ -22,7 +24,8 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # Setup AWS
-client = boto3.client('bedrock-runtime')
+bedrock_runtime = boto3.client('bedrock-runtime')
+s3_client = boto3.client("s3")
 
 # Setup Streamlit
 st.set_page_config(
@@ -39,7 +42,7 @@ def generate_image(prompt, negative_prompt, guidance_scale, num_inference_steps,
     """
 
     if seed is None:
-        seed = randint(0, 858993459)
+        seed = random.randint(0, 858993459)
 
     request_body = {
         "cfg_scale": guidance_scale,
@@ -72,6 +75,61 @@ def generate_image(prompt, negative_prompt, guidance_scale, num_inference_steps,
     if "images" in response:
         image = file_utils.save_base64_images(response["images"], output_directory, "image")
     return response, image
+
+
+
+def generate_video(s3_destination_bucket, video_prompt, model_id="amazon.nova-reel-v1:0"):
+    """
+    Generate a video using the provided prompt.
+    
+    Args:
+        s3_destination_bucket (str): The S3 bucket where the video will be stored
+        video_prompt (str): Text prompt describing the desired video
+
+    Adapted from: https://github.com/ngnatk/amazon-nova-samples/blob/main/multimodal-generation/video-generation/python/01_text_to_video_generation.py
+    """
+
+    # Create the S3 bucket
+    s3_client.create_bucket(Bucket=s3_destination_bucket)
+
+    model_input = {
+        "taskType": "TEXT_VIDEO",
+        "textToVideoParams": {
+            "text": video_prompt,
+        },
+        "videoGenerationConfig": {
+            "durationSeconds": 6,  # 6 is the only supported value currently
+            "fps": 24,  # 24 is the only supported value currently
+            "dimension": "1280x720",  # "1280x720" is the only supported value currently
+            "seed": random.randint(
+                0, 2147483648
+            ),  # A random seed guarantees we'll get a different result each time this code runs
+        },
+    }
+
+    try:
+        # Start the asynchronous video generation job
+        invocation = bedrock_runtime.start_async_invoke(
+            modelId=model_id,
+            modelInput=model_input,
+            outputDataConfig={"s3OutputDataConfig": {"s3Uri": f"s3://{s3_destination_bucket}"}},
+        )
+
+        # Store the invocation ARN
+        invocation_arn = invocation["invocationArn"]
+
+        # Pretty print the response JSON
+        logger.info("\nResponse:")
+        logger.info(json.dumps(invocation, indent=2, default=str))
+
+        # Save the invocation details for later reference
+        amazon_video_util.save_invocation_info(invocation, model_input)
+
+        return invocation_arn
+
+    except Exception as e:
+        logger.error(e)
+        return None
 
 
 
@@ -154,19 +212,39 @@ def tab_background_removal():
         img_base64 = base64.b64encode(img_bytes).decode("utf-8")
 
         # Remove background and display the image
-        response, response_image = remove_background(img_base64)
-        st.image(response_image, caption="Processed Image", use_container_width=True)
+        with st.spinner():
+            response, response_image = remove_background(img_base64)
+            st.image(response_image, caption="Processed Image", use_container_width=True)
 
+
+
+def tab_reel():
+    # img = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
+    prompt = st.text_area("Enter your video prompt:", height=100)
+
+    if st.button("Generate Video"):
+        if prompt:
+            try:
+                invocation_arn = generate_video(prompt)
+                st.success(f"Video generation job started: {invocation_arn}")
+                st.write(json.dumps(response, indent=2, default=str))
+            except Exception as e:
+                st.error(f"Error generating video: {str(e)}")
+        else:
+            st.warning("Please enter a prompt to generate a video")
 
 
 def main():
-    tab1, tab2 = st.tabs(["Canvas", "Background Removal"])
+    tab1, tab2, tab3 = st.tabs(["Canvas", "Background Removal", "Reel"])
 
     with tab1:
         tab_canvas()
 
     with tab2:
         tab_background_removal()
+
+    with tab3:
+        tab_reel()
 
 
 
